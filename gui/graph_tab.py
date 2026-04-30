@@ -1,64 +1,75 @@
 """
-Graph tab — force-directed Collatz graph visualisation.
+Graph tab — hierarchical Collatz graph visualisation.
 
-Shows every integer in [1, n] (up to MAX_NODES) as a node, with directed
-edges  v → collatz_step(v)  when the successor also belongs to the graph.
+Node set
+--------
+For n ≤ MAX_N we show every integer in [1, n] **plus** every value that
+appears in n's Collatz path to 1 (some path values exceed n and were
+previously invisible, making the chosen node appear disconnected).
+
+Edges
+-----
+For each visible node v we follow Collatz steps until we land on another
+visible node and draw the (possibly compressed) edge there.  This ensures
+every node has an outgoing edge and the graph is fully connected.
+
+Layout
+------
+Nodes are placed in horizontal layers by stopping time.  Up to MAX_LEVELS
+distinct y-bands are used; when there are more unique stopping times than
+MAX_LEVELS the times are binned so no band is thinner than ~1 node radius.
+Within each band the x-spreading physics runs until velocities settle.
 
 Colour coding
 -------------
   Chosen n           blue   (#89b4fa)
   On n's path to 1   yellow (#f9e2af)
   All other nodes    dim grey (#45475a)
-
-Physics
--------
-Spring / repulsion force-directed layout with velocity damping and a
-tiny random drift, giving a slow "underwater" feel.  Runs at ~30 fps
-via tk.Canvas.after().  Nodes can be dragged; the graph topology is
-preserved.
 """
 from __future__ import annotations
 
 import math
 import random
-import tkinter as tk
+from collections import defaultdict
 from dataclasses import dataclass
 from tkinter import ttk
+import tkinter as tk
 
-from collatz.core import step as _cstep
+from collatz.core import step as _cstep, total_stopping_time as _tst
 
-# --------------------------------------------------------------------------
-# Colours
-# --------------------------------------------------------------------------
-from gui.theme import BG_DARK as _BG, BG_PANEL as _BG_PANEL, FG_TEXT as _FG
+from gui.theme import BG_DARK as _BG, FG_TEXT as _FG
 from gui.theme import FG_ACCENT as _ACCENT, COL_PATH as _PATH, BTN_BG as _OTHER
 
-_EDGE_HOT = "#89dceb"   # edge between highlighted nodes
-_EDGE_DIM = "#585b70"   # all other edges
+_EDGE_HOT = "#89dceb"
+_EDGE_DIM  = "#585b70"
 
-# --------------------------------------------------------------------------
-# Node geometry
-# --------------------------------------------------------------------------
-_R_CHOSEN = 18
-_R_PATH   = 14
-_R_OTHER  = 10
+_R_CHOSEN = 16
+_R_PATH   = 12
+_R_OTHER  = 9
 
-# --------------------------------------------------------------------------
-# Physics constants
-# --------------------------------------------------------------------------
-_REPULSION  = 5000.0   # pairwise repulsion strength
-_SPRING_K   = 0.035    # spring constant along edges
-_REST_LEN   = 85.0     # natural spring length (pixels)
-_DAMPING    = 0.82     # velocity damping per tick  (lower = floatier)
-_GRAVITY    = 0.007    # pull toward canvas centre
-_DRIFT      = 0.25     # random drift amplitude per tick
+# Maximum integer range shown alongside the path.
+MAX_N = 150
 
-MAX_NODES = 300        # upper cap before we fall back to path-only mode
+# Maximum number of distinct y-bands in the layout.
+# When unique stopping times exceed this, they are binned.
+MAX_LEVELS = 28
 
+# Physics — x-axis spreading only; y is anchored to each band.
+_X_REPULSION = 3500.0
+_X_SPRING_K  = 0.03
+_X_REST_LEN  = 60.0
+_X_CENTER_K  = 0.012
+_Y_ANCHOR_K  = 0.40
+_DAMPING     = 0.68
+_SETTLE_VEL  = 0.35
+_MAX_TICKS   = 600
 
-# --------------------------------------------------------------------------
-# Data
-# --------------------------------------------------------------------------
+# y-proximity threshold: only repel nodes whose bands are close in y.
+_LAYER_Y_THRESH = 85.0
+
+# Steps to follow when searching for the next visible node.
+_MAX_FOLLOW  = 2_000_000
+
 
 @dataclass
 class _Node:
@@ -67,6 +78,7 @@ class _Node:
     radius:   int
     x:        float = 0.0
     y:        float = 0.0
+    target_y: float = 0.0
     vx:       float = 0.0
     vy:       float = 0.0
     dragging: bool  = False
@@ -74,26 +86,23 @@ class _Node:
     text_id:  int   = -1
 
 
-# --------------------------------------------------------------------------
-# Tab widget
-# --------------------------------------------------------------------------
-
 class GraphTab(ttk.Frame):
-    """Notebook tab with a live force-directed Collatz graph."""
+    """Notebook tab with a hierarchical, self-settling Collatz graph."""
 
     def __init__(self, parent: ttk.Notebook) -> None:
         super().__init__(parent)
-        self._nodes:      list[_Node]           = []
-        self._edges:      list[tuple[int, int]] = []   # (src_idx, dst_idx)
-        self._edge_ids:   list[int]             = []    # canvas item IDs
-        self._running:    bool                  = False
-        self._after_id:   str | None            = None  # pending after() callback
-        self._tick_ms:    int                   = 33
-        self._drag_node:  _Node | None          = None
-        self._drag_ox:    float                 = 0.0
-        self._drag_oy:    float                 = 0.0
-        self._pan_start:  tuple[float, float] | None        = None
-        self._pan_base:   list[tuple[float, float]]         = []
+        self._nodes:      list[_Node]                      = []
+        self._edges:      list[tuple[int, int]]            = []
+        self._edge_ids:   list[int]                        = []
+        self._running:    bool                             = False
+        self._after_id:   str | None                       = None
+        self._tick_ms:    int                              = 33
+        self._tick_count: int                              = 0
+        self._drag_node:  _Node | None                     = None
+        self._drag_ox:    float                            = 0.0
+        self._drag_oy:    float                            = 0.0
+        self._pan_start:  tuple[float, float] | None       = None
+        self._pan_base:   list[tuple[float, float, float]] = []
         self._build()
 
     # ------------------------------------------------------------------
@@ -107,7 +116,6 @@ class GraphTab(ttk.Frame):
             bg=_BG, fg=_FG, font=("TkDefaultFont", 8), anchor="w", padx=8,
         ).pack(fill=tk.X, pady=(4, 0))
 
-        # Legend row
         legend = tk.Frame(self, bg=_BG)
         legend.pack(fill=tk.X, padx=8, pady=(2, 0))
         for colour, label in ((_ACCENT, "chosen n"), (_PATH, "n's path"), (_OTHER, "other")):
@@ -117,16 +125,20 @@ class GraphTab(ttk.Frame):
             tk.Label(legend, text=label, bg=_BG, fg=_FG,
                      font=("TkDefaultFont", 7)).pack(side=tk.LEFT, padx=(0, 10))
 
+        tk.Label(
+            legend,
+            text="scroll=zoom  middle-drag=pan  left-drag=move node",
+            bg=_BG, fg="#6c7086", font=("TkDefaultFont", 7),
+        ).pack(side=tk.RIGHT, padx=8)
+
         self._canvas = tk.Canvas(self, bg=_BG, highlightthickness=0)
         self._canvas.pack(fill=tk.BOTH, expand=True)
         self._canvas.bind("<ButtonPress-1>",   self._on_press)
         self._canvas.bind("<B1-Motion>",       self._on_drag)
         self._canvas.bind("<ButtonRelease-1>", self._on_release)
-        # Scroll-wheel zoom (Linux Button-4/5; Windows/macOS MouseWheel)
         self._canvas.bind("<MouseWheel>", self._on_scroll)
         self._canvas.bind("<Button-4>",   self._on_scroll)
         self._canvas.bind("<Button-5>",   self._on_scroll)
-        # Middle-button pan
         self._canvas.bind("<ButtonPress-2>",  self._on_pan_start)
         self._canvas.bind("<B2-Motion>",      self._on_pan)
 
@@ -135,30 +147,42 @@ class GraphTab(ttk.Frame):
     # ------------------------------------------------------------------
 
     def build_graph(self, n: int, seq: list[int]) -> None:
-        """Rebuild and animate the Collatz graph for starting value *n*."""
+        """Rebuild and display the Collatz graph for starting value *n*."""
         self._stop()
         self._canvas.delete("all")
-        self._nodes    = []
-        self._edges    = []
-        self._edge_ids = []
+        self._nodes      = []
+        self._edges      = []
+        self._edge_ids   = []
+        self._tick_count = 0
 
         path_set = set(seq)
 
-        if n <= MAX_NODES:
-            node_values = list(range(1, n + 1))
-            self._info_var.set(
-                f"n = {n:,} — {len(node_values)} nodes.  "
-                "Drag any node to rearrange."
-            )
+        if n <= MAX_N:
+            # Show every integer in [1, n] PLUS every value on n's path to 1.
+            # Path values that exceed n are included so the chosen node and
+            # every step of its journey are always visible and connected.
+            node_set    = set(range(1, n + 1)) | path_set
+            node_values = sorted(node_set)
+            n_integers  = n
+            n_extra     = len(node_values) - n_integers
+            if n_extra:
+                self._info_var.set(
+                    f"n = {n:,} — integers 1–{n} + {n_extra} path node(s) above n  "
+                    f"({len(node_values)} total).  Layered by stopping time."
+                )
+            else:
+                self._info_var.set(
+                    f"n = {n:,} — {len(node_values)} nodes.  "
+                    "Layered by stopping time."
+                )
         else:
-            # Too many nodes for a comfortable layout; show only path values.
+            # n is large: show only the Collatz path from n to 1.
             node_values = sorted(path_set)
             self._info_var.set(
-                f"n = {n:,} is large — showing the {len(node_values)} nodes "
-                f"on its path to 1  (cap: {MAX_NODES})."
+                f"n = {n:,} is large — showing the {len(node_values)} "
+                f"nodes on its path to 1."
             )
 
-        # Build node list
         val_to_idx: dict[int, int] = {}
         for i, v in enumerate(node_values):
             if v == n:
@@ -170,38 +194,78 @@ class GraphTab(ttk.Frame):
             self._nodes.append(_Node(value=v, fill=fill, radius=radius))
             val_to_idx[v] = i
 
-        # Build edge list: v → collatz_step(v)  (if successor is in our set)
+        # Build edges: follow Collatz steps from each node until we land on
+        # another visible node.  This guarantees full connectivity even when
+        # the immediate successor is outside the visible set.
+        val_set = set(val_to_idx)
         for i, node in enumerate(self._nodes):
             if node.value == 1:
                 continue
-            succ = _cstep(node.value)
-            if succ in val_to_idx:
-                self._edges.append((i, val_to_idx[succ]))
-
-        # Slower tick for denser graphs
-        self._tick_ms = 33 if n <= 100 else (50 if n <= 200 else 66)
+            current = node.value
+            for _ in range(_MAX_FOLLOW):
+                current = _cstep(current)
+                if current in val_set:
+                    self._edges.append((i, val_to_idx[current]))
+                    break
 
         self._init_positions()
         self._draw_all()
         self._start()
 
     # ------------------------------------------------------------------
-    # Initialisation
+    # Position initialisation — hierarchical by stopping time
     # ------------------------------------------------------------------
 
     def _init_positions(self) -> None:
         self._canvas.update_idletasks()
         w = max(self._canvas.winfo_width(), 500)
         h = max(self._canvas.winfo_height(), 400)
-        cx, cy = w / 2, h / 2
-        nn = len(self._nodes)
-        if nn == 0:
-            return
-        radius = min(w, h) * 0.38
-        for i, node in enumerate(self._nodes):
-            angle = 2 * math.pi * i / nn
-            node.x = cx + radius * math.cos(angle)
-            node.y = cy + radius * math.sin(angle)
+
+        # Stopping time = number of Collatz steps from the node to 1.
+        try:
+            stop_times = {nd.value: _tst(nd.value) for nd in self._nodes}
+        except Exception:
+            stop_times = {nd.value: i for i, nd in enumerate(self._nodes)}
+
+        # Bin distinct stopping times into at most MAX_LEVELS y-bands so
+        # that nodes are never packed into sub-pixel rows.
+        distinct_sorted = sorted(set(stop_times.values()))
+        n_distinct = len(distinct_sorted)
+
+        if n_distinct <= MAX_LEVELS:
+            time_to_band = {t: rank for rank, t in enumerate(distinct_sorted)}
+            n_bands = n_distinct
+        else:
+            # Map each distinct time to one of MAX_LEVELS evenly-sized bins.
+            n_bands = MAX_LEVELS
+            time_to_band = {
+                t: min(int(rank * n_bands / n_distinct), n_bands - 1)
+                for rank, t in enumerate(distinct_sorted)
+            }
+
+        # Group nodes into bands.
+        band_groups: dict[int, list[_Node]] = defaultdict(list)
+        for nd in self._nodes:
+            band_groups[time_to_band[stop_times[nd.value]]].append(nd)
+
+        pad_x = 55
+        pad_y = 50
+
+        for band, band_nodes in band_groups.items():
+            # band 0 (node 1, lowest stopping time) → bottom of canvas.
+            frac = band / max(n_bands - 1, 1)
+            y = h - pad_y - (h - 2 * pad_y) * frac
+
+            n_at = len(band_nodes)
+            for i, nd in enumerate(band_nodes):
+                x = (
+                    pad_x + (w - 2 * pad_x) * i / (n_at - 1)
+                    if n_at > 1
+                    else w / 2
+                )
+                nd.x        = x + random.uniform(-1.5, 1.5)
+                nd.y        = y
+                nd.target_y = y
 
     # ------------------------------------------------------------------
     # Canvas drawing
@@ -212,7 +276,6 @@ class GraphTab(ttk.Frame):
         canvas.delete("all")
         self._edge_ids = []
 
-        # Edges (drawn first, so nodes sit on top)
         hot = {_ACCENT, _PATH}
         for src_i, dst_i in self._edges:
             src = self._nodes[src_i]
@@ -227,24 +290,22 @@ class GraphTab(ttk.Frame):
             )
             self._edge_ids.append(eid)
 
-        # Nodes
-        for node in self._nodes:
-            r = node.radius
+        for nd in self._nodes:
+            r = nd.radius
             oid = canvas.create_oval(
-                node.x - r, node.y - r, node.x + r, node.y + r,
-                fill=node.fill, outline=_BG, width=2, tags="node",
+                nd.x - r, nd.y - r, nd.x + r, nd.y + r,
+                fill=nd.fill, outline=_BG, width=2, tags="node",
             )
-            # Dark text on light nodes, light text on dark nodes
-            fg = _BG if node.fill in (_ACCENT, _PATH) else _FG
-            fs = 7 if node.value > 99 else (8 if node.value > 9 else 9)
+            fg = _BG if nd.fill in (_ACCENT, _PATH) else _FG
+            fs = 7 if nd.value > 99 else (8 if nd.value > 9 else 9)
             tid = canvas.create_text(
-                node.x, node.y,
-                text=str(node.value),
+                nd.x, nd.y,
+                text=str(nd.value),
                 fill=fg, font=("TkDefaultFont", fs, "bold"),
                 tags="label",
             )
-            node.oval_id = oid
-            node.text_id = tid
+            nd.oval_id = oid
+            nd.text_id = tid
 
     def _update_canvas(self) -> None:
         canvas = self._canvas
@@ -253,26 +314,25 @@ class GraphTab(ttk.Frame):
             dst = self._nodes[dst_i]
             x1, y1, x2, y2 = self._edge_endpoints(src, dst)
             canvas.coords(self._edge_ids[idx], x1, y1, x2, y2)
-        for node in self._nodes:
-            r = node.radius
-            canvas.coords(node.oval_id,
-                          node.x - r, node.y - r, node.x + r, node.y + r)
-            canvas.coords(node.text_id, node.x, node.y)
+        for nd in self._nodes:
+            r = nd.radius
+            canvas.coords(nd.oval_id, nd.x - r, nd.y - r, nd.x + r, nd.y + r)
+            canvas.coords(nd.text_id, nd.x, nd.y)
 
     @staticmethod
     def _edge_endpoints(src: _Node, dst: _Node) -> tuple[float, float, float, float]:
-        """Return (x1,y1,x2,y2) at the node circumferences, not centres."""
         dx = dst.x - src.x
         dy = dst.y - src.y
-        d = math.sqrt(dx * dx + dy * dy) + 0.001
-        x1 = src.x + dx * src.radius / d
-        y1 = src.y + dy * src.radius / d
-        x2 = dst.x - dx * dst.radius / d
-        y2 = dst.y - dy * dst.radius / d
-        return x1, y1, x2, y2
+        d  = math.sqrt(dx * dx + dy * dy) + 0.001
+        return (
+            src.x + dx * src.radius / d,
+            src.y + dy * src.radius / d,
+            dst.x - dx * dst.radius / d,
+            dst.y - dy * dst.radius / d,
+        )
 
     # ------------------------------------------------------------------
-    # Physics loop
+    # Physics loop — runs until settled, then stops
     # ------------------------------------------------------------------
 
     def _start(self) -> None:
@@ -290,81 +350,88 @@ class GraphTab(ttk.Frame):
         if not self._running or not self._nodes:
             return
 
+        self._tick_count += 1
         nodes = self._nodes
-        nn = len(nodes)
-        w = self._canvas.winfo_width() or 500
-        h = self._canvas.winfo_height() or 400
-        cx, cy = w / 2, h / 2
+        nn    = len(nodes)
+        w     = self._canvas.winfo_width() or 500
+        cx    = w / 2.0
 
         xs = [nd.x for nd in nodes]
         ys = [nd.y for nd in nodes]
         fx = [0.0] * nn
         fy = [0.0] * nn
 
-        # Pairwise repulsion
+        # Pairwise x-repulsion — skip pairs whose bands are far apart in y.
         for i in range(nn):
             for j in range(i + 1, nn):
-                ddx = xs[i] - xs[j]
                 ddy = ys[i] - ys[j]
+                if abs(ddy) > _LAYER_Y_THRESH:
+                    continue
+                ddx = xs[i] - xs[j]
                 d2  = ddx * ddx + ddy * ddy + 1.0
                 d   = math.sqrt(d2)
-                f   = _REPULSION / d2
+                f   = _X_REPULSION / d2
                 ffx = f * ddx / d
-                ffy = f * ddy / d
-                fx[i] += ffx;  fy[i] += ffy
-                fx[j] -= ffx;  fy[j] -= ffy
+                fx[i] += ffx
+                fx[j] -= ffx
 
-        # Spring attraction along edges
+        # x-spring along edges.
         for si, di in self._edges:
             ddx = xs[di] - xs[si]
-            ddy = ys[di] - ys[si]
-            d   = math.sqrt(ddx * ddx + ddy * ddy) + 0.001
-            f   = _SPRING_K * (d - _REST_LEN)
-            ffx = f * ddx / d
-            ffy = f * ddy / d
-            fx[si] += ffx;  fy[si] += ffy
-            fx[di] -= ffx;  fy[di] -= ffy
+            d   = abs(ddx) + 0.001
+            f   = _X_SPRING_K * (d - _X_REST_LEN)
+            ffx = f * (ddx / d)
+            fx[si] += ffx
+            fx[di] -= ffx
 
-        # Per-node: gravity + drift + integrate
-        for i, node in enumerate(nodes):
-            if node.dragging:
+        max_speed = 0.0
+        for i, nd in enumerate(nodes):
+            if nd.dragging:
                 continue
-            fx[i] += _GRAVITY * (cx - xs[i])
-            fy[i] += _GRAVITY * (cy - ys[i])
-            fx[i] += random.uniform(-_DRIFT, _DRIFT)
-            fy[i] += random.uniform(-_DRIFT, _DRIFT)
-            node.vx = (node.vx + fx[i]) * _DAMPING
-            node.vy = (node.vy + fy[i]) * _DAMPING
-            node.x  += node.vx
-            node.y  += node.vy
+            fx[i] += _X_CENTER_K * (cx - xs[i])
+            fy[i]  = _Y_ANCHOR_K * (nd.target_y - ys[i])
+
+            nd.vx = (nd.vx + fx[i]) * _DAMPING
+            nd.vy = (nd.vy + fy[i]) * _DAMPING
+            nd.x += nd.vx
+            nd.y += nd.vy
+
+            speed = math.sqrt(nd.vx * nd.vx + nd.vy * nd.vy)
+            if speed > max_speed:
+                max_speed = speed
 
         self._update_canvas()
+
+        if max_speed < _SETTLE_VEL or self._tick_count >= _MAX_TICKS:
+            self._running = False
+            return
+
         self._after_id = self._canvas.after(self._tick_ms, self._tick)
 
     # ------------------------------------------------------------------
-    # Mouse / drag
+    # Mouse — drag, zoom, pan
     # ------------------------------------------------------------------
 
     def _on_press(self, event: tk.Event) -> None:  # type: ignore[type-arg]
         best: _Node | None = None
         best_d2 = float("inf")
-        for node in self._nodes:
-            dx = event.x - node.x
-            dy = event.y - node.y
+        for nd in self._nodes:
+            dx = event.x - nd.x
+            dy = event.y - nd.y
             d2 = dx * dx + dy * dy
-            hit = (node.radius + 6) ** 2
-            if d2 < hit and d2 < best_d2:
-                best, best_d2 = node, d2
+            if d2 < (nd.radius + 6) ** 2 and d2 < best_d2:
+                best, best_d2 = nd, d2
         if best is not None:
             self._drag_node = best
-            best.dragging  = True
-            self._drag_ox  = event.x - best.x
-            self._drag_oy  = event.y - best.y
+            best.dragging   = True
+            self._drag_ox   = event.x - best.x
+            self._drag_oy   = event.y - best.y
 
     def _on_drag(self, event: tk.Event) -> None:  # type: ignore[type-arg]
         if self._drag_node is not None:
             self._drag_node.x = event.x - self._drag_ox
             self._drag_node.y = event.y - self._drag_oy
+            self._update_canvas()
 
     def _on_release(self, _event: tk.Event) -> None:  # type: ignore[type-arg]
         if self._drag_node is not None:
@@ -372,29 +439,33 @@ class GraphTab(ttk.Frame):
             self._drag_node.vy = 0.0
             self._drag_node.dragging = False
             self._drag_node = None
+            if not self._running:
+                self._tick_count = 0
+                self._start()
 
     def _on_scroll(self, event: tk.Event) -> None:  # type: ignore[type-arg]
-        """Zoom in/out centred on the cursor position."""
         if not self._nodes:
             return
         zoom_in = event.num == 4 or (hasattr(event, "delta") and event.delta > 0)
-        factor = 1.1 if zoom_in else (1.0 / 1.1)
-        cx, cy = float(event.x), float(event.y)
-        for node in self._nodes:
-            node.x = cx + (node.x - cx) * factor
-            node.y = cy + (node.y - cy) * factor
+        factor  = 1.1 if zoom_in else (1.0 / 1.1)
+        cx, cy  = float(event.x), float(event.y)
+        for nd in self._nodes:
+            nd.x        = cx + (nd.x        - cx) * factor
+            nd.y        = cy + (nd.y        - cy) * factor
+            nd.target_y = cy + (nd.target_y - cy) * factor
+        self._update_canvas()
 
     def _on_pan_start(self, event: tk.Event) -> None:  # type: ignore[type-arg]
-        """Record starting position for a middle-button pan gesture."""
         self._pan_start = (float(event.x), float(event.y))
-        self._pan_base  = [(n.x, n.y) for n in self._nodes]
+        self._pan_base  = [(nd.x, nd.y, nd.target_y) for nd in self._nodes]
 
     def _on_pan(self, event: tk.Event) -> None:  # type: ignore[type-arg]
-        """Translate all nodes by the middle-button drag offset."""
         if self._pan_start is None or not self._nodes:
             return
         dx = event.x - self._pan_start[0]
         dy = event.y - self._pan_start[1]
-        for node, (bx, by) in zip(self._nodes, self._pan_base):
-            node.x = bx + dx
-            node.y = by + dy
+        for nd, (bx, by, bty) in zip(self._nodes, self._pan_base):
+            nd.x        = bx  + dx
+            nd.y        = by  + dy
+            nd.target_y = bty + dy
+        self._update_canvas()
