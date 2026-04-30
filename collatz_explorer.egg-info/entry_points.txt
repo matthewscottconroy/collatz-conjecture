@@ -1,0 +1,2 @@
+[console_scripts]
+collatz-explorer = main:main

@@ -1,0 +1,311 @@
+Metadata-Version: 2.4
+Name: collatz-explorer
+Version: 1.0.0
+Summary: Interactive explorer for interesting Collatz conjecture sequences
+License: MIT
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: matplotlib>=3.7
+Requires-Dist: numpy>=1.24
+Provides-Extra: dev
+Requires-Dist: pytest>=7.4; extra == "dev"
+Requires-Dist: pytest-cov>=4.1; extra == "dev"
+
+# Collatz Conjecture Explorer
+
+An interactive Python application for discovering and visualising interesting
+behaviour in the Collatz (3x+1) conjecture.
+
+---
+
+## Background
+
+The **Collatz conjecture** states that for any positive integer *n*, repeated
+application of the function
+
+```
+f(n) = n / 2        if n is even
+f(n) = 3 * n + 1    if n is odd
+```
+
+eventually reaches 1.  Despite being simple to state, it remains unproven.
+
+This project focuses not on the proof, but on the rich variety of behaviour
+exhibited by individual sequences — long trajectories, dramatic peaks,
+near-cyclic oscillation, and striking visual patterns.
+
+---
+
+## Features
+
+| Feature | Description |
+|---------|-------------|
+| **Trajectory plot** | Step-by-step value plot, linear or log scale |
+| **Phase portrait** | `seq[k]` vs `seq[k+1]`, optionally on log–log axes |
+| **Range scan** | Bar chart of stopping times or altitude scatter for any [start, end] |
+| **Comparison view** | Overlay multiple sequences on one canvas |
+| **Library browser** | Curated catalogue of 30+ interesting starting values with descriptions |
+| **Statistics panel** | Stopping time, peak, altitude, glide, oscillation index, near-cycle score |
+| **CLI mode** | No GUI required for scripting and batch analysis |
+
+---
+
+## Metrics
+
+| Metric | Meaning |
+|--------|---------|
+| **Stopping time** | Total steps to reach 1 |
+| **Peak value** | Maximum value encountered |
+| **Altitude** | `peak / n` — how high relative to the start |
+| **Glide** | Steps until first drop below `n` |
+| **Oscillation index** | Fraction of steps that are local maxima |
+| **Band persistence** | Longest fraction spent within a 4× value band (near-cycle hint) |
+| **Near-cycle score** | 0–1; 1 = perfectly equal local maxima (cycle-like) |
+
+---
+
+## Requirements
+
+- Python **3.10 or later**
+
+---
+
+## Getting Started
+
+### 0 — Install tkinter (Linux only)
+
+`tkinter` is part of the Python standard library but is packaged separately on
+most Linux distributions.  It must be installed **before** creating the virtual
+environment because venvs inherit from the system Python.
+
+```bash
+# Debian / Ubuntu
+sudo apt install python3-tk
+
+# Fedora / RHEL
+sudo dnf install python3-tkinter
+```
+
+On **macOS** tkinter is included with the python.org installer (Homebrew builds
+may need `brew install python-tk`).  On **Windows** it is included with the
+standard installer — ensure the *tcl/tk and IDLE* optional feature is ticked.
+
+### 1 — Clone or download the project
+
+```bash
+git clone <repository-url> collatz-explorer
+cd collatz-explorer
+```
+
+Or download and extract the ZIP, then open a terminal in the project folder.
+
+### 2 — Create a virtual environment
+
+Python's built-in `venv` module creates an isolated environment so project
+dependencies do not interfere with other Python projects on your machine.
+
+```bash
+python3 -m venv .venv
+```
+
+This creates a `.venv/` directory inside the project folder.
+
+### 3 — Activate the virtual environment
+
+The activation command differs by platform and shell:
+
+| Platform | Shell | Command |
+|----------|-------|---------|
+| Linux / macOS | bash / zsh | `source .venv/bin/activate` |
+| Windows | Command Prompt | `.venv\Scripts\activate.bat` |
+| Windows | PowerShell | `.venv\Scripts\Activate.ps1` |
+
+Your prompt will show `(.venv)` when the environment is active.  All
+subsequent `python` and `pip` commands in this session use the isolated
+environment.
+
+### 4 — Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+To also install the optional development tools (pytest, coverage):
+
+```bash
+pip install -e ".[dev]"
+```
+
+### 5 — Run the application
+
+**GUI (default):**
+
+```bash
+python main.py
+```
+
+**CLI — print trajectory statistics:**
+
+```bash
+python main.py --cli 27
+```
+
+**CLI — scan a range and rank by a metric:**
+
+```bash
+# Top-10 by stopping time in [1, 1000]:
+python main.py --scan 1 1000
+
+# Use a different metric:
+python main.py --scan 1 1000 --metric altitude
+python main.py --scan 1 1000 --metric oscillation_index
+```
+
+Available `--metric` values: `stopping_time`, `altitude`, `oscillation_index`,
+`band_persistence`, `near_cycle_score`.
+
+### 6 — Deactivate the virtual environment
+
+When you are done, return your shell to its normal state:
+
+```bash
+deactivate
+```
+
+---
+
+## Usage
+
+### GUI
+
+1. Type any positive integer in the **Explore** box and press Enter or click
+   **Explore** (or double-click a library entry to jump straight to it).
+2. Browse the **Library** tree on the left to jump to known interesting values.
+3. Use the tabs to switch between plot types.
+4. Click **+ Compare** to queue the current `n` for the **Compare** tab.
+5. Use the **Range Scan** tab to analyse a whole range at once — scans run in
+   the background so the UI stays responsive.
+6. Export any plot via **File → Export current plot…**
+
+### CLI
+
+```bash
+# Print trajectory statistics for n=27:
+python main.py --cli 27
+
+# Print top-10 by stopping time in [1, 1000]:
+python main.py --scan 1 1000
+
+# Use a different metric:
+python main.py --scan 1 1000 --metric altitude
+python main.py --scan 1 1000 --metric oscillation_index
+```
+
+### Library API
+
+```python
+from collatz.library import by_category, by_tag, find_entry
+
+# All "long trajectory" entries:
+for entry in by_category("long_trajectory"):
+    print(entry)
+
+# Entries tagged "record":
+for entry in by_tag("record"):
+    print(f"{entry.n}: {entry.description}")
+
+# Look up a specific n:
+for entry in find_entry(837799):
+    print(entry.notes)
+```
+
+### Programmatic analysis
+
+```python
+from collatz import compute_stats, find_interesting
+
+# Detailed stats for one number:
+stats = compute_stats(27)
+print(stats.summary())
+
+# Top 10 by altitude in [1, 10000]:
+for n, altitude in find_interesting(1, 10_000, metric="altitude", top_n=10):
+    print(f"n={n:,}  altitude={altitude:.1f}×")
+```
+
+---
+
+## Running Tests
+
+```bash
+pytest                        # All tests with verbose output
+pytest --cov=collatz          # With coverage report
+pytest tests/test_core.py     # One module only
+```
+
+All tests are in `tests/` and use **pytest**.  The test suite covers:
+
+- `test_core.py` — `step`, `sequence`, `sequence_iter`, `total_stopping_time`,
+  `is_power_of_two`, `max_iter` boundary cases, recursion-depth regression
+- `test_analysis.py` — all metrics, `TrajectoryStats`, `find_interesting`
+- `test_library.py` — library integrity (pre-computed statistics verified
+  against live computation), accessor functions
+- `test_visualization.py` — smoke tests for every plot function, `seq`
+  parameter consistency, axes properties
+
+---
+
+## Project Structure
+
+```
+collatz-explorer/
+├── main.py                  Entry point (GUI + CLI)
+├── collatz/
+│   ├── __init__.py          Public API
+│   ├── core.py              Sequence computation (step, sequence, stopping time)
+│   ├── analysis.py          Statistical metrics and TrajectoryStats
+│   ├── library.py           Curated catalogue of interesting starting values
+│   └── visualization.py     Matplotlib plot helpers
+├── gui/
+│   ├── __init__.py
+│   └── app.py               Tkinter + matplotlib GUI application
+├── tests/
+│   ├── test_core.py
+│   ├── test_analysis.py
+│   ├── test_library.py
+│   └── test_visualization.py
+├── pyproject.toml
+└── requirements.txt
+```
+
+---
+
+## Notable Library Entries
+
+| n | Name | Stopping time | Peak | Altitude |
+|---|------|--------------|------|----------|
+| 27 | The Celebrity | 111 | 9,232 | 342× |
+| 703 | Triple Digits Champion | 170 | 250,504 | 356× |
+| 837,799 | Million Milestone | 524 | 2,974,984,576 | 3,551× |
+| 4 | Trivial Cycle Start | 2 | 4 | 1× |
+| 1,024 | 2¹⁰ | 10 | 1,024 | 1× |
+
+---
+
+## Interesting Things to Try
+
+- Compare 27 and 703 on the **Compare** tab — both have long trajectories
+  but very different shapes.
+- Scan [1, 1000] by *altitude* to find the highest-climbing numbers.
+- Switch to **Log Scale** for n=837799 to see its full structure without
+  the peak dwarfing everything else.
+- Look at the **Phase Portrait** for n=27 to see the characteristic 3n+1
+  fan-out and ÷2 collapse structure.
+- Scan [1, 100] by *near\_cycle\_score* to find numbers that oscillate
+  most persistently within a narrow band.
+
+---
+
+## License
+
+MIT
